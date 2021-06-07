@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 from torch.nn import init
-from torch.autograd import Variable
 
 import numpy as np
+import os
 import time
+import json
 import random
+import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from collections import defaultdict
 
@@ -56,7 +58,7 @@ class MeanAggregator(nn.Module):
         unique_nodes_list = list(set.union(*samp_neighs))
       #  print ("\n unl's size=",len(unique_nodes_list))
         unique_nodes = {n:i for i,n in enumerate(unique_nodes_list)}
-        mask = Variable(torch.zeros(len(samp_neighs), len(unique_nodes)))
+        mask = torch.zeros(len(samp_neighs), len(unique_nodes))
         column_indices = [unique_nodes[n] for samp_neigh in samp_neighs for n in samp_neigh]   
         row_indices = [i for i in range(len(samp_neighs)) for j in range(len(samp_neighs[i]))]
         mask[row_indices, column_indices] = 1
@@ -143,7 +145,7 @@ def load_cora():
     labels = np.empty((num_nodes,1), dtype=np.int64)
     node_map = {}
     label_map = {}
-    with open("../cora/cora.content") as fp:
+    with open("./cora/cora.content") as fp:
         for i,line in enumerate(fp):
             info = line.strip().split()
             feat_data[i,:] = [float(x) for x in info[1:-1]]
@@ -153,56 +155,139 @@ def load_cora():
             labels[i] = label_map[info[-1]]
 
     adj_lists = defaultdict(set)
-    with open("../cora/cora.cites") as fp:
+    with open("./cora/cora.cites") as fp:
         for i,line in enumerate(fp):
             info = line.strip().split()
             paper1 = node_map[info[0]]
             paper2 = node_map[info[1]]
             adj_lists[paper1].add(paper2)
             adj_lists[paper2].add(paper1)
-    return feat_data, labels, adj_lists
 
-def run_cora():
-    np.random.seed(1)
-    random.seed(1)
-    num_nodes = 2708
-    feat_data, labels, adj_lists = load_cora()
-    features = nn.Embedding(2708, 1433)
-    features.weight = nn.Parameter(torch.FloatTensor(feat_data), requires_grad=False)
-   # features.cuda()
-
-    agg1 = MeanAggregator(features, cuda=True)
-    enc1 = Encoder(features, 1433, 128, adj_lists, agg1, gcn=True, cuda=False)
-    agg2 = MeanAggregator(lambda nodes : enc1(nodes).t(), cuda=False)
-    enc2 = Encoder(lambda nodes : enc1(nodes).t(), enc1.embed_dim, 128, adj_lists, agg2,
-            base_model=enc1, gcn=True, cuda=False)
-    enc1.num_samples = 5
-    enc2.num_samples = 5
-
-    graphsage = SupervisedGraphSage(7, enc2)
-#    graphsage.cuda()
     rand_indices = np.random.permutation(num_nodes)
     test = rand_indices[:1000]
     val = rand_indices[1000:1500]
     train = list(rand_indices[1500:])
 
-    optimizer = torch.optim.SGD(filter(lambda p : p.requires_grad, graphsage.parameters()), lr=0.7)
+    return feat_data, labels, adj_lists, train, val, test
+
+def load_data(prefix, label_idx=None):
+    root = "/checkpoint/yuandong/datasets/" + prefix
+    graph = json.load(open(os.path.join(root, f"{prefix}-G.json")))
+    id_map = json.load(open(os.path.join(root, f"{prefix}-id_map.json")))
+    class_map = json.load(open(os.path.join(root, f"{prefix}-class_map.json")))
+    feat_data = np.load(os.path.join(root, f"{prefix}-feats.npy"))
+
+    num_nodes = feat_data.shape[0]
+    # For all nodes that are not used, assign them -1.
+    # They won't get sampled since train/test/eval won't have it. 
+    labels = -np.ones((num_nodes,1), dtype=np.int64)
+
+    # Edge connections
+    adj_lists = defaultdict(set)
+    for link in graph["links"]:
+        s_idx = link["source"]
+        t_idx = link["target"]
+        adj_lists[s_idx].add(t_idx)
+        adj_lists[t_idx].add(s_idx)
+
+    train = []
+    test = []
+    val = []
+    isolated = []
+
+    for node in graph["nodes"]:
+        id = str(node["id"]) 
+        idx = id_map[id]
+
+        # do not include the idx to any sets, if it is not connected with anyone else. 
+        if len(adj_lists[idx]) == 0:
+            isolated.append(idx)
+            continue
+
+        if node["test"]:
+            test.append(idx)
+        elif node["val"]:
+            val.append(idx)
+        else:
+            train.append(idx)
+        if label_idx is None:
+            labels[idx] = class_map[id]
+        else:
+            # ppi has a lot of labels at each vertex
+            labels[idx] = class_map[id][label_idx] # [0]
+
+    return feat_data, labels, adj_lists, train, val, test, isolated
+
+def run_cora():
+    cuda = True
+    np.random.seed(1)
+    random.seed(1)
+    # feat_data, labels, adj_lists, train, val, test = load_cora()
+    prefix = "reddit"
+    load = True
+    filename = prefix + ".th"
+
+    if not load:
+        all_data = load_data(prefix, None)
+        print(f"Saving {filename}")
+        torch.save(all_data, filename)
+    else:
+        print(f"Loading {filename}")
+        all_data = torch.load(filename)
+
+    feat_data, labels, adj_lists, train, val, test, isolated = all_data 
+
+    num_nodes, d = feat_data.shape
+    num_classes = max(labels).item() + 1
+    hidd_dim = 128
+
+    print(f"#node: {num_nodes}, #isolated: {len(isolated)}, #num_class: {num_classes}, feature_dim: {d}, hidd_dim: {hidd_dim}")
+
+    features = nn.Embedding(num_nodes, d)
+    features.weight = nn.Parameter(torch.FloatTensor(feat_data), requires_grad=False)
+    if cuda:
+        features.cuda()
+
+    agg1 = MeanAggregator(features, cuda=cuda)
+    enc1 = Encoder(features, d, hidd_dim, adj_lists, agg1, gcn=True, cuda=cuda)
+    agg2 = MeanAggregator(lambda nodes : enc1(nodes).t(), cuda=cuda)
+    enc2 = Encoder(lambda nodes : enc1(nodes).t(), enc1.embed_dim, hidd_dim, adj_lists, agg2,
+            base_model=enc1, gcn=True, cuda=cuda)
+    enc1.num_samples = 5
+    enc2.num_samples = 5
+
+    graphsage = SupervisedGraphSage(num_classes, enc2)
+    graphsage.cuda()
+
+    params = filter(lambda p : p.requires_grad, graphsage.parameters())
+    # optimizer = torch.optim.SGD(params, lr=0.7)
+    optimizer = torch.optim.Adam(params, lr=0.01)
     times = []
-    for batch in range(100):
+    for batch in range(10):
         batch_nodes = train[:256]
+        # print(batch_nodes)
         random.shuffle(train)
         start_time = time.time()
         optimizer.zero_grad()
-        loss = graphsage.loss(batch_nodes, 
-                Variable(torch.LongTensor(labels[np.array(batch_nodes)])))
+        x = torch.LongTensor(labels[np.array(batch_nodes)])
+        if cuda:
+            x = x.cuda()
+
+        if (x < 0).sum().item() != 0:
+            print("Something wrong!")
+            import pdb
+            pdb.set_trace()
+
+        loss = graphsage.loss(batch_nodes, x)
         loss.backward()
         optimizer.step()
         end_time = time.time()
         times.append(end_time-start_time)
         print (batch, loss.item())
 
+    graphsage = graphsage.to('cpu')
     val_output = graphsage.forward(val) 
-    print ("Validation F1:", f1_score(labels[val], val_output.data.numpy().argmax(axis=1), average="micro"))
+    print ("Validation F1:", f1_score(labels[val], val_output.cpu().numpy().argmax(axis=1), average="micro"))
     print ("Average batch time:", np.mean(times))
 
 if __name__ == "__main__":
